@@ -4,31 +4,42 @@ For every market of Polymarket's "Next CEO of NVIDIA?" event, forecast the Yes
 price for the next 240 minutes as five quantiles (0.05, 0.25, 0.5, 0.75, 0.95).
 
 Method (no model call, no network, stdlib only) — final, chosen by backtest
-grid over 6 practice cases (own scorer, validated: it reproduces the house
-persistence baseline practice loss 0.363589 exactly):
+on 6 practice cases AND 3 out-of-sample Nov-11 cases (see tune_regime.py):
   - MEDIAN: mean-reversion toward the market's fair value (its last price
     divided by the sum of all markets' last prices — the 24 Yes prices sum
     to >1, the overround), with a ~2h half-life: fair + (x - fair)*exp(-h/120).
-    The long-run (72h) mean is a TERRIBLE target (tested: 0.955) — the price's
-    recent level is what matters.
+    BUT the reversion is REGIME-AWARE: its weight is
+    w = clip(1 - |S-1| / 0.5, 0, 1), where S is the sum of last prices.
+    When the market is well-formed (S near 1) the reversion applies fully;
+    when S is far from 1 (a distorted / opening regime) the median stays at
+    the last price. Reason (ablation, tune_regime.py): unconditional
+    reversion is the best on practice but CATASTROPHIC in a volatile regime
+    (Nov-11 extra cases: 3.38 vs persistence 2.32); the soft gate keeps
+    practice at 0.278 while holding the stress test at 2.34 (persistence
+    2.32). The long-run (72h) mean is a TERRIBLE target (tested: 0.955).
   - SPREAD: the empirical h-minute changes over the RECENT 12h, CENTRED by
     their own median (so the median stays the mean-reverting one), at anchors
     H = [1, 2, 4, 8, 16, 32, 64, 128, 240], log-interpolated. Centring was
     the key fix: v1's uncentred 72h empirical distribution (0.478) was
     dominated by the long-run trend and dead volatility regimes.
-  - The spread is SHRUNK x0.6 (a single jump in the window otherwise inflates
-    the tails: every overlapping h-minute window containing it inherits it)
-    and ADAPTIVELY SCALED by the recent 120-min mean |1-min move| over the
-    12h mean |1-min move|, clipped to [0.5, 2.0] (widens when the market is
-    currently active, narrows when quiet).
+  - The spread is SHRUNK ASYMMETRICALLY: downside (quantiles below the
+    median) x0.9, upside x0.5. A crash hurts the pinball loss more than a
+    rally for high-priced markets, so the downside tail is preserved more.
+    (Symmetric 0.6 scored 0.282; asymmetric 0.9/0.5 scored 0.277.)
+    It is ADAPTIVELY SCALED by the recent 120-min mean |1-min move| over
+    the 12h mean |1-min move|, clipped to [0.5, 2.0] (widens when the
+    market is currently active, narrows when quiet).
   - Rejected by the grid: momentum in the median (hurts), Gaussian MAD sigma
-    (0.390), sum-to-one median (0.314), per-tau shrink, 6h window, winsorising.
+    (0.390), sum-to-one median (0.314), per-tau shrink, 6h window,
+    winsorising, EWMA-weighted quantiles, 4h-trend drift.
   - All quantiles clamped to [0, 1], rounded to 6 decimals, non-decreasing.
 
-Practice loss: 0.281947 (persistence baseline 0.363589; dev board top 0.256,
-rank-100 0.275). Honest read: competitive (beats the house baseline by 22%),
-top-half of the field, but a long shot for a prize — the gate is the house
-superbot's final score, which cannot be measured from here.
+Validation: practice loss 0.277999 (persistence baseline 0.363589; dev
+board top 0.251, rank-100 0.275). Out-of-sample Nov-11 stress test:
+2.342513 vs persistence 2.324628 (no blow-up). Honest read: competitive
+(beats the house baseline by 24% on practice), top-half of the field, but
+a long shot for a prize — the gate is the house superbot's final score,
+which cannot be measured from here.
 """
 
 import json
@@ -39,7 +50,8 @@ from pathlib import Path
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 ANCHORS = [1, 2, 4, 8, 16, 32, 64, 128, 240]
 WINDOW_MINUTES = 720
-SHRINK = 0.6
+SHRINK_DOWN = 0.9
+SHRINK_UP = 0.5
 HALF_LIFE_MIN = 120.0
 
 
@@ -67,10 +79,17 @@ def _mean_abs_move(prices):
     return sum(abs(b - a) for a, b in zip(prices, prices[1:])) / (len(prices) - 1)
 
 
-def forecast_market(prices, horizon, fair):
+def _revert_weight(total):
+    """How much to trust the sum-to-one fair value: 1 when the market is
+    well-formed (sum near 1), 0 when it is distorted (sum far from 1)."""
+    return max(0.0, min(1.0, 1.0 - abs(total - 1.0) / 0.5))
+
+
+def forecast_market(prices, horizon, fair, weight):
     """Return horizon rows x 5 quantiles for one market's price list.
 
-    `fair` is the market's fair value (last price / sum of last prices).
+    `fair` is the market's fair value (last price / sum of last prices);
+    `weight` is the regime-aware reversion weight (0..1).
     """
     if not prices:
         raise ValueError("market has no prices")
@@ -110,8 +129,9 @@ def forecast_market(prices, horizon, fair):
                 w = (math.log(h) - math.log(lo)) / (math.log(hi) - math.log(lo))
                 qs = [anchor_q[lo][j] * (1.0 - w) + anchor_q[hi][j] * w
                       for j in range(len(QUANTILES))]
-        med = fair + (x - fair) * math.exp(-h / HALF_LIFE_MIN)
-        row = [med + d * SHRINK * scale if j != 2 else med
+        rev = fair + (x - fair) * math.exp(-h / HALF_LIFE_MIN)
+        med = x + weight * (rev - x)
+        row = [med if j == 2 else med + d * (SHRINK_DOWN if j < 2 else SHRINK_UP) * scale
                for j, d in enumerate(qs)]
         row = [_price6(v) for v in row]
         for j in range(1, len(row)):
@@ -126,10 +146,11 @@ def forecast_case(case):
     horizon = case["horizon_minutes"]
     lasts = {m["id"]: m["prices"][-1] for m in case["markets"]}
     total = sum(lasts.values())
+    weight = _revert_weight(total)
     out = {}
     for m in case["markets"]:
         fair = lasts[m["id"]] / total if total > 0 else lasts[m["id"]]
-        out[m["id"]] = forecast_market(m["prices"], horizon, fair)
+        out[m["id"]] = forecast_market(m["prices"], horizon, fair, weight)
     return out
 
 
